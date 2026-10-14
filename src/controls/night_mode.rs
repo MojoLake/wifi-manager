@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::os::fd::AsFd;
+use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
 
@@ -93,17 +94,38 @@ impl Dispatch<ZwlrGammaControlV1, ()> for AppState {
 pub(crate) const NIGHT_MODE_INIT_TIMEOUT: std::time::Duration =
     std::time::Duration::from_millis(1000);
 
-/// Manages the Wayland background thread and handles sending updated
-/// color temperatures to the compositor for night mode rendering.
+/// Manages a background worker that applies color temperatures for night mode.
+///
+/// Two backends are supported, chosen automatically in [`NightModeManager::new`]:
+/// - `wlr-gamma-control` (Sway, Hyprland, River, other wlroots compositors)
+/// - KDE Plasma Night Light (KWin does not implement `wlr-gamma-control`)
 pub(crate) struct NightModeManager {
     sender: Option<mpsc::Sender<f64>>,
-    wayland_handle: Option<thread::JoinHandle<()>>,
+    worker_handle: Option<thread::JoinHandle<()>>,
 }
 
 impl NightModeManager {
-    /// Initializes a new NightModeManager, spawning a background thread to lock and
-    /// manipulate the `wlr_gamma_control_v1` Wayland protocol outputs.
+    /// Initializes a new NightModeManager. Tries the `wlr-gamma-control` backend
+    /// first and falls back to the KDE backend when running under Plasma.
     pub(crate) fn new() -> Result<Self, Box<dyn std::error::Error>> {
+        match Self::new_wlr() {
+            Ok(manager) => Ok(manager),
+            Err(wlr_err) => {
+                if kde_backend_available() {
+                    log::info!(
+                        "wlr-gamma-control unavailable ({wlr_err}); using KDE Night Light backend"
+                    );
+                    Ok(Self::new_kde())
+                } else {
+                    Err(wlr_err)
+                }
+            }
+        }
+    }
+
+    /// Spawns a background thread to lock and manipulate the `wlr_gamma_control_v1`
+    /// Wayland protocol outputs.
+    fn new_wlr() -> Result<Self, Box<dyn std::error::Error>> {
         let (tx, rx) = mpsc::channel();
         let (init_tx, init_rx) = mpsc::channel();
 
@@ -121,13 +143,21 @@ impl NightModeManager {
 
         // Block on initialization status from Wayland thread
         match init_rx.recv_timeout(NIGHT_MODE_INIT_TIMEOUT) {
-            Ok(Ok(())) => Ok(NightModeManager { sender: Some(tx), wayland_handle: Some(handle) }),
+            Ok(Ok(())) => Ok(NightModeManager { sender: Some(tx), worker_handle: Some(handle) }),
             Ok(Err(e)) => Err(e),
             Err(e) => Err(format!("Night mode wayland thread initialization failed: {}", e).into()),
         }
     }
 
-    /// Sends a new color temperature (in Kelvin) down the channel to the Wayland thread.
+    /// Spawns the KDE worker thread. It only touches KWin's config when a
+    /// temperature is actually requested, never at startup.
+    fn new_kde() -> Self {
+        let (tx, rx) = mpsc::channel();
+        let handle = thread::spawn(move || run_kde_thread(rx));
+        NightModeManager { sender: Some(tx), worker_handle: Some(handle) }
+    }
+
+    /// Sends a new color temperature (in Kelvin) down the channel to the worker thread.
     pub(crate) fn set_temperature(&self, temp: f64) -> Result<(), mpsc::SendError<f64>> {
         if let Some(tx) = &self.sender {
             match tx.send(temp) {
@@ -143,10 +173,10 @@ impl NightModeManager {
 impl Drop for NightModeManager {
     fn drop(&mut self) {
         let _ = self.sender.take();
-        if let Some(handle) = self.wayland_handle.take()
+        if let Some(handle) = self.worker_handle.take()
             && let Err(e) = handle.join()
         {
-            log::error!("Failed to join Wayland thread: {:?}", e);
+            log::error!("Failed to join night mode worker thread: {:?}", e);
         }
     }
 }
@@ -348,4 +378,101 @@ fn apply_gamma_ramps(
     }
 
     Ok(new_files)
+}
+
+// ── KDE Plasma backend ─────────────────────────────────────────────────────
+//
+// KWin does not implement `wlr-gamma-control`, and its D-Bus NightLight
+// interface is read-only apart from a temporary `preview`. The reliable way to
+// drive Night Light is to write the [NightColor] group of `kwinrc` and notify
+// KWin with `kwriteconfig6 --notify`.
+//
+// Mapping used by this backend:
+//   temperature >= 6500K  -> Active=false (neutral; NightTemperature untouched)
+//   temperature <  6500K  -> NightTemperature=<K> then Active=true
+//
+// `Mode` is deliberately left alone. The slider only has a visible effect
+// all day with `Mode=Constant`; with a schedule, KDE applies the temperature
+// only during the scheduled night period.
+
+/// Neutral temperature: at or above this, Night Light is switched off.
+const KDE_NEUTRAL_KELVIN: u32 = 6500;
+/// Lowest temperature KDE accepts.
+const KDE_MIN_KELVIN: u32 = 1000;
+
+/// True when running under KDE and `kwriteconfig6` can be executed.
+fn kde_backend_available() -> bool {
+    let is_kde = std::env::var("XDG_CURRENT_DESKTOP")
+        .map(|v| v.split(':').any(|part| part.eq_ignore_ascii_case("KDE")))
+        .unwrap_or(false);
+    if !is_kde {
+        return false;
+    }
+    Command::new("kwriteconfig6")
+        .arg("--help")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+/// Writes one key of the `[NightColor]` group in `kwinrc` and notifies KWin.
+fn kde_write(key: &str, value: &str) -> bool {
+    match Command::new("kwriteconfig6")
+        .args(["--file", "kwinrc", "--group", "NightColor", "--key", key, value, "--notify"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+    {
+        Ok(status) if status.success() => true,
+        Ok(status) => {
+            log::warn!("kwriteconfig6 failed for NightColor/{key}={value}: {status}");
+            false
+        }
+        Err(e) => {
+            log::warn!("Failed to run kwriteconfig6 for NightColor/{key}={value}: {e}");
+            false
+        }
+    }
+}
+
+/// Applies one requested temperature. `last_*` cache what this thread last
+/// wrote, to avoid spawning needless processes while the slider is dragged.
+fn apply_kde_temperature(temp: f64, last_active: &mut Option<bool>, last_temp: &mut Option<u32>) {
+    let kelvin =
+        (temp.round() as i64).clamp(KDE_MIN_KELVIN as i64, KDE_NEUTRAL_KELVIN as i64) as u32;
+
+    if kelvin >= KDE_NEUTRAL_KELVIN {
+        if *last_active != Some(false) && kde_write("Active", "false") {
+            *last_active = Some(false);
+        }
+        return;
+    }
+
+    // Set the temperature first so enabling never flashes the previous value.
+    if *last_temp != Some(kelvin) {
+        if !kde_write("NightTemperature", &kelvin.to_string()) {
+            return;
+        }
+        *last_temp = Some(kelvin);
+    }
+    if *last_active != Some(true) && kde_write("Active", "true") {
+        *last_active = Some(true);
+    }
+}
+
+/// Worker loop: waits for a request, collapses any requests that piled up
+/// while the previous write was running, then applies only the latest one.
+/// This gives live feedback while dragging without flooding kwriteconfig6.
+fn run_kde_thread(rx: mpsc::Receiver<f64>) {
+    let mut last_active: Option<bool> = None;
+    let mut last_temp: Option<u32> = None;
+
+    while let Ok(mut temp) = rx.recv() {
+        while let Ok(newer) = rx.try_recv() {
+            temp = newer;
+        }
+        apply_kde_temperature(temp, &mut last_active, &mut last_temp);
+    }
 }
