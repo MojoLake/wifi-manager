@@ -162,9 +162,23 @@ pub(crate) fn setup_controls(widgets: &PanelWidgets) {
         Ok(manager) => {
             let manager = Rc::new(manager);
 
-            // Apply initial state from state.toml
-            let night_enabled = store_nm.borrow().night_mode.enabled;
-            let night_temp = store_nm.borrow().night_mode.temperature;
+            // Initial state. When the desktop owns Night Light (KDE backend) its
+            // settings win over state.toml, so the panel never contradicts them.
+            // Otherwise (wlr backend) the app's saved state is used.
+            let external = manager.external_state();
+            let (night_enabled, night_temp) = match external {
+                Some(state) => {
+                    let mut store = store_nm.borrow_mut();
+                    store.night_mode.enabled = state.enabled;
+                    store.night_mode.temperature = state.temperature;
+                    store.save();
+                    (state.enabled, state.temperature)
+                }
+                None => {
+                    let store = store_nm.borrow();
+                    (store.night_mode.enabled, store.night_mode.temperature)
+                }
+            };
 
             let max = n_scale.adjustment().upper();
             n_scale.set_value(kelvin_to_slider(night_temp, max));
@@ -173,7 +187,10 @@ pub(crate) fn setup_controls(widgets: &PanelWidgets) {
             if night_enabled {
                 n_scale.set_sensitive(true);
                 controls_panel::set_button_glyph(&night_mode_btn, &icon_config.night_mode_on_icon);
-                if let Err(e) = manager.set_temperature(night_temp) {
+                // State read from the desktop is already applied there.
+                if external.is_none()
+                    && let Err(e) = manager.set_temperature(night_temp)
+                {
                     log::warn!("Failed to apply initial night mode temperature: {}", e);
                 }
             } else {

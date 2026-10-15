@@ -1,8 +1,10 @@
 use std::collections::HashMap;
+use std::io::{self, Read};
 use std::os::fd::AsFd;
-use std::process::{Command, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
 use std::sync::mpsc;
 use std::thread;
+use std::time::{Duration, Instant};
 
 use memmap2::MmapMut;
 use rustix::fs::{MemfdFlags, memfd_create};
@@ -102,6 +104,15 @@ pub(crate) const NIGHT_MODE_INIT_TIMEOUT: std::time::Duration =
 pub(crate) struct NightModeManager {
     sender: Option<mpsc::Sender<f64>>,
     worker_handle: Option<thread::JoinHandle<()>>,
+    external_state: Option<NightModeState>,
+}
+
+/// Night Mode state owned by the desktop rather than by this app
+/// (currently only reported by the KDE backend).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct NightModeState {
+    pub(crate) enabled: bool,
+    pub(crate) temperature: f64,
 }
 
 impl NightModeManager {
@@ -143,18 +154,29 @@ impl NightModeManager {
 
         // Block on initialization status from Wayland thread
         match init_rx.recv_timeout(NIGHT_MODE_INIT_TIMEOUT) {
-            Ok(Ok(())) => Ok(NightModeManager { sender: Some(tx), worker_handle: Some(handle) }),
+            Ok(Ok(())) => Ok(NightModeManager {
+                sender: Some(tx),
+                worker_handle: Some(handle),
+                external_state: None,
+            }),
             Ok(Err(e)) => Err(e),
             Err(e) => Err(format!("Night mode wayland thread initialization failed: {}", e).into()),
         }
     }
 
-    /// Spawns the KDE worker thread. It only touches KWin's config when a
-    /// temperature is actually requested, never at startup.
+    /// Reads KDE's current Night Light settings, then spawns the KDE worker thread.
+    /// Nothing is written to `kwinrc` until a temperature is actually requested.
     fn new_kde() -> Self {
+        let external_state = match read_kde_settings() {
+            Ok(settings) => Some(settings.ui_state()),
+            Err(e) => {
+                log::warn!("Could not read KDE Night Light settings: {e}");
+                None
+            }
+        };
         let (tx, rx) = mpsc::channel();
         let handle = thread::spawn(move || run_kde_thread(rx));
-        NightModeManager { sender: Some(tx), worker_handle: Some(handle) }
+        NightModeManager { sender: Some(tx), worker_handle: Some(handle), external_state }
     }
 
     /// Sends a new color temperature (in Kelvin) down the channel to the worker thread.
@@ -167,6 +189,12 @@ impl NightModeManager {
         } else {
             Err(mpsc::SendError(temp))
         }
+    }
+
+    /// State read from the desktop at startup, if the desktop owns Night Mode.
+    /// `None` means this app owns the state (wlr backend) or it could not be read.
+    pub(crate) fn external_state(&self) -> Option<NightModeState> {
+        self.external_state
     }
 }
 
@@ -384,23 +412,142 @@ fn apply_gamma_ramps(
 //
 // KWin does not implement `wlr-gamma-control`, and its D-Bus NightLight
 // interface is read-only apart from a temporary `preview`. The reliable way to
-// drive Night Light is to write the [NightColor] group of `kwinrc` and notify
-// KWin with `kwriteconfig6 --notify`.
+// drive Night Light is the [NightColor] group of `kwinrc`, written with
+// `kwriteconfig6 --notify` and read with `kreadconfig6`.
 //
-// Mapping used by this backend:
-//   temperature >= 6500K  -> Active=false (neutral; NightTemperature untouched)
-//   temperature <  6500K  -> NightTemperature=<K> then Active=true
-//
-// `Mode` is deliberately left alone. The slider only has a visible effect
-// all day with `Mode=Constant`; with a schedule, KDE applies the temperature
-// only during the scheduled night period.
+// Semantics: the panel's Night Mode toggle means "warm now, constant", i.e. a
+// manual override of KDE's schedule.
+//   * Switching on  : remember KDE's previous Active/Mode (if it was not
+//                     already manual), then write NightTemperature,
+//                     Mode=Constant and Active=true.
+//   * Switching off : restore the remembered Active/Mode, unless the user has
+//                     changed them in KDE in the meantime. With nothing to
+//                     restore, write Active=false.
+//   * Slider        : same as switching on, with the new temperature.
+// No KDE state is cached between requests: every write is decided from the
+// request itself, so changes made through KDE's own settings never leave the
+// controls stuck. `NightTemperature` is shared with KDE's schedule and is not
+// restored. The remembered settings live in memory only, so restarting the
+// app while the override is on forgets them.
 
-/// Neutral temperature: at or above this, Night Light is switched off.
+/// Neutral temperature: at or above this, the override is switched off.
 const KDE_NEUTRAL_KELVIN: u32 = 6500;
 /// Lowest temperature KDE accepts.
 const KDE_MIN_KELVIN: u32 = 1000;
+/// KDE's default `NightTemperature`.
+const KDE_DEFAULT_KELVIN: u32 = 4500;
+/// `Mode` value for "always on".
+const KDE_MODE_CONSTANT: &str = "Constant";
+/// Upper bound for a single kwriteconfig6/kreadconfig6 invocation.
+const KDE_COMMAND_TIMEOUT: Duration = Duration::from_secs(1);
+const COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(10);
+/// How long to wait for captured output once the child is gone.
+const COMMAND_OUTPUT_GRACE: Duration = Duration::from_millis(200);
+const COMMAND_OUTPUT_LIMIT: u64 = 4096;
 
-/// True when running under KDE and `kwriteconfig6` can be executed.
+/// Why an external command did not succeed.
+#[derive(Debug)]
+enum CommandError {
+    Spawn(io::Error),
+    Wait(io::Error),
+    Timeout { after: Duration, stderr: String },
+    Failed { status: ExitStatus, stderr: String },
+}
+
+fn write_stderr(f: &mut std::fmt::Formatter<'_>, stderr: &str) -> std::fmt::Result {
+    if stderr.is_empty() { Ok(()) } else { write!(f, ": {stderr}") }
+}
+
+impl std::fmt::Display for CommandError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CommandError::Spawn(e) => write!(f, "failed to start command: {e}"),
+            CommandError::Wait(e) => write!(f, "failed to wait for command: {e}"),
+            CommandError::Timeout { after, stderr } => {
+                write!(f, "command timed out after {after:?} and was killed")?;
+                write_stderr(f, stderr)
+            }
+            CommandError::Failed { status, stderr } => {
+                write!(f, "command exited with {status}")?;
+                write_stderr(f, stderr)
+            }
+        }
+    }
+}
+
+/// Reads a pipe on its own thread (so a chatty child can never block on a full
+/// pipe) and delivers the first `COMMAND_OUTPUT_LIMIT` bytes at EOF.
+fn spawn_reader<R: Read + Send + 'static>(mut pipe: R) -> mpsc::Receiver<String> {
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = (&mut pipe).take(COMMAND_OUTPUT_LIMIT).read_to_end(&mut buf);
+        let _ = io::copy(&mut pipe, &mut io::sink());
+        let _ = tx.send(String::from_utf8_lossy(&buf).trim().to_owned());
+    });
+    rx
+}
+
+fn collect_output(rx: Option<mpsc::Receiver<String>>) -> String {
+    rx.and_then(|rx| rx.recv_timeout(COMMAND_OUTPUT_GRACE).ok()).unwrap_or_default()
+}
+
+/// Runs `cmd` and returns its trimmed stdout. A child that outlives `timeout`
+/// is killed and reaped. stderr is captured for error reporting.
+fn run_with_timeout(cmd: &mut Command, timeout: Duration) -> Result<String, CommandError> {
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(CommandError::Spawn)?;
+    let stdout_rx = child.stdout.take().map(spawn_reader);
+    let stderr_rx = child.stderr.take().map(spawn_reader);
+    let deadline = Instant::now() + timeout;
+
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let stdout = collect_output(stdout_rx);
+                let stderr = collect_output(stderr_rx);
+                return if status.success() {
+                    Ok(stdout)
+                } else {
+                    Err(CommandError::Failed { status, stderr })
+                };
+            }
+            Ok(None) if Instant::now() >= deadline => {
+                // Kill, then reap so no zombie process is left behind.
+                let _ = child.kill();
+                let _ = child.wait();
+                let stderr = collect_output(stderr_rx);
+                return Err(CommandError::Timeout { after: timeout, stderr });
+            }
+            Ok(None) => thread::sleep(COMMAND_POLL_INTERVAL),
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(CommandError::Wait(e));
+            }
+        }
+    }
+}
+
+/// Writes one key of the `[NightColor]` group in `kwinrc` and notifies KWin.
+fn kde_write(key: &str, value: &str) -> Result<(), CommandError> {
+    let mut cmd = Command::new("kwriteconfig6");
+    cmd.args(["--file", "kwinrc", "--group", "NightColor", "--key", key, value, "--notify"]);
+    run_with_timeout(&mut cmd, KDE_COMMAND_TIMEOUT).map(|_| ())
+}
+
+/// Reads one key of the `[NightColor]` group in `kwinrc`.
+fn kde_read(key: &str, default: &str) -> Result<String, CommandError> {
+    let mut cmd = Command::new("kreadconfig6");
+    cmd.args(["--file", "kwinrc", "--group", "NightColor", "--key", key, "--default", default]);
+    run_with_timeout(&mut cmd, KDE_COMMAND_TIMEOUT)
+}
+
+/// True when running under KDE and both config tools can be executed.
 fn kde_backend_available() -> bool {
     let is_kde = std::env::var("XDG_CURRENT_DESKTOP")
         .map(|v| v.split(':').any(|part| part.eq_ignore_ascii_case("KDE")))
@@ -408,71 +555,264 @@ fn kde_backend_available() -> bool {
     if !is_kde {
         return false;
     }
-    Command::new("kwriteconfig6")
-        .arg("--help")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
+    ["kwriteconfig6", "kreadconfig6"].iter().all(|tool| {
+        match run_with_timeout(Command::new(tool).arg("--help"), KDE_COMMAND_TIMEOUT) {
+            Ok(_) => true,
+            Err(e) => {
+                log::debug!("KDE backend unavailable: {tool}: {e}");
+                false
+            }
+        }
+    })
 }
 
-/// Writes one key of the `[NightColor]` group in `kwinrc` and notifies KWin.
-fn kde_write(key: &str, value: &str) -> bool {
-    match Command::new("kwriteconfig6")
-        .args(["--file", "kwinrc", "--group", "NightColor", "--key", key, value, "--notify"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-    {
-        Ok(status) if status.success() => true,
-        Ok(status) => {
-            log::warn!("kwriteconfig6 failed for NightColor/{key}={value}: {status}");
-            false
-        }
-        Err(e) => {
-            log::warn!("Failed to run kwriteconfig6 for NightColor/{key}={value}: {e}");
-            false
-        }
+/// KDE's `[NightColor]` settings that matter to this backend.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct KdeSettings {
+    active: bool,
+    mode: String,
+    temperature: u32,
+}
+
+impl KdeSettings {
+    /// Always-on Night Light, i.e. what the panel's toggle means by "on".
+    fn is_manual(&self) -> bool {
+        self.active && self.mode == KDE_MODE_CONSTANT
+    }
+
+    fn ui_state(&self) -> NightModeState {
+        NightModeState { enabled: self.is_manual(), temperature: f64::from(self.temperature) }
     }
 }
 
-/// Applies one requested temperature. `last_*` cache what this thread last
-/// wrote, to avoid spawning needless processes while the slider is dragged.
-fn apply_kde_temperature(temp: f64, last_active: &mut Option<bool>, last_temp: &mut Option<u32>) {
+fn parse_kde_bool(value: &str) -> bool {
+    value.trim().eq_ignore_ascii_case("true")
+}
+
+fn parse_kde_temperature(value: &str) -> u32 {
+    value
+        .trim()
+        .parse::<u32>()
+        .unwrap_or(KDE_DEFAULT_KELVIN)
+        .clamp(KDE_MIN_KELVIN, KDE_NEUTRAL_KELVIN)
+}
+
+fn read_kde_settings() -> Result<KdeSettings, CommandError> {
+    let active = parse_kde_bool(&kde_read("Active", "false")?);
+    let mode = kde_read("Mode", "Automatic")?;
+    let mode = if mode.is_empty() { "Automatic".to_owned() } else { mode };
+    let temperature =
+        parse_kde_temperature(&kde_read("NightTemperature", &KDE_DEFAULT_KELVIN.to_string())?);
+    Ok(KdeSettings { active, mode, temperature })
+}
+
+/// What a requested temperature means for KDE.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KdeTarget {
+    /// 6500K or more: no color shift, switch the override off.
+    Neutral,
+    /// Warm override at this temperature (1000..6500K).
+    Warm(u32),
+}
+
+fn kde_target(temp: f64) -> KdeTarget {
+    if !temp.is_finite() {
+        return KdeTarget::Neutral;
+    }
     let kelvin =
-        (temp.round() as i64).clamp(KDE_MIN_KELVIN as i64, KDE_NEUTRAL_KELVIN as i64) as u32;
+        temp.round().clamp(f64::from(KDE_MIN_KELVIN), f64::from(KDE_NEUTRAL_KELVIN)) as u32;
+    if kelvin >= KDE_NEUTRAL_KELVIN { KdeTarget::Neutral } else { KdeTarget::Warm(kelvin) }
+}
 
-    if kelvin >= KDE_NEUTRAL_KELVIN {
-        if *last_active != Some(false) && kde_write("Active", "false") {
-            *last_active = Some(false);
+/// Only undo our override if it is still in place; if KDE's settings were
+/// changed meanwhile, leave them alone. Unknown state (read failed) restores.
+fn should_restore(current: Option<&KdeSettings>) -> bool {
+    current.map(KdeSettings::is_manual).unwrap_or(true)
+}
+
+#[derive(Default)]
+struct KdeNightLight {
+    /// KDE's settings from before the override was switched on.
+    saved: Option<KdeSettings>,
+}
+
+impl KdeNightLight {
+    fn apply(&mut self, temp: f64) -> Result<(), CommandError> {
+        match kde_target(temp) {
+            KdeTarget::Warm(kelvin) => self.enable(kelvin),
+            KdeTarget::Neutral => self.disable(),
         }
-        return;
     }
 
-    // Set the temperature first so enabling never flashes the previous value.
-    if *last_temp != Some(kelvin) {
-        if !kde_write("NightTemperature", &kelvin.to_string()) {
-            return;
+    fn enable(&mut self, kelvin: u32) -> Result<(), CommandError> {
+        if self.saved.is_none() {
+            match read_kde_settings() {
+                Ok(current) if !current.is_manual() => self.saved = Some(current),
+                Ok(_) => {} // already manual: nothing to restore later
+                Err(e) => log::warn!("Could not read KDE settings before enabling: {e}"),
+            }
         }
-        *last_temp = Some(kelvin);
+        // Temperature first so enabling never flashes the previous value.
+        // Mode before Active so KDE's schedule cannot take over.
+        kde_write("NightTemperature", &kelvin.to_string())?;
+        kde_write("Mode", KDE_MODE_CONSTANT)?;
+        kde_write("Active", "true")
     }
-    if *last_active != Some(true) && kde_write("Active", "true") {
-        *last_active = Some(true);
+
+    fn disable(&mut self) -> Result<(), CommandError> {
+        let Some(saved) = self.saved.take() else {
+            return kde_write("Active", "false");
+        };
+        let current = match read_kde_settings() {
+            Ok(current) => Some(current),
+            Err(e) => {
+                log::warn!("Could not read KDE settings before restoring: {e}");
+                None
+            }
+        };
+        if !should_restore(current.as_ref()) {
+            return Ok(());
+        }
+        kde_write("Mode", &saved.mode)?;
+        kde_write("Active", if saved.active { "true" } else { "false" })
     }
 }
 
 /// Worker loop: waits for a request, collapses any requests that piled up
-/// while the previous write was running, then applies only the latest one.
+/// while the previous one was being written, then applies only the latest.
 /// This gives live feedback while dragging without flooding kwriteconfig6.
 fn run_kde_thread(rx: mpsc::Receiver<f64>) {
-    let mut last_active: Option<bool> = None;
-    let mut last_temp: Option<u32> = None;
-
+    let mut kde = KdeNightLight::default();
     while let Ok(mut temp) = rx.recv() {
         while let Ok(newer) = rx.try_recv() {
             temp = newer;
         }
-        apply_kde_temperature(temp, &mut last_active, &mut last_temp);
+        if let Err(e) = kde.apply(temp) {
+            log::warn!("Failed to apply KDE Night Light ({temp}K): {e}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn kde(active: bool, mode: &str) -> KdeSettings {
+        KdeSettings { active, mode: mode.to_owned(), temperature: 4500 }
+    }
+
+    fn sh(script: &str) -> Command {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", script]);
+        cmd
+    }
+
+    // ── temperature mapping ──────────────────────────────────────
+
+    #[test]
+    fn neutral_at_and_above_6500k() {
+        assert_eq!(kde_target(6500.0), KdeTarget::Neutral);
+        assert_eq!(kde_target(6499.6), KdeTarget::Neutral); // rounds to 6500
+        assert_eq!(kde_target(9000.0), KdeTarget::Neutral);
+    }
+
+    #[test]
+    fn warm_below_6500k_is_rounded() {
+        assert_eq!(kde_target(6499.4), KdeTarget::Warm(6499));
+        assert_eq!(kde_target(4000.0), KdeTarget::Warm(4000));
+        assert_eq!(kde_target(3000.4), KdeTarget::Warm(3000));
+    }
+
+    #[test]
+    fn warm_is_clamped_to_kde_minimum() {
+        assert_eq!(kde_target(500.0), KdeTarget::Warm(1000));
+        assert_eq!(kde_target(-1.0), KdeTarget::Warm(1000));
+    }
+
+    #[test]
+    fn non_finite_temperature_is_neutral() {
+        assert_eq!(kde_target(f64::NAN), KdeTarget::Neutral);
+        assert_eq!(kde_target(f64::INFINITY), KdeTarget::Neutral);
+    }
+
+    // ── KDE settings handling ────────────────────────────────────
+
+    #[test]
+    fn parses_kde_values_with_fallbacks() {
+        assert!(parse_kde_bool("true"));
+        assert!(parse_kde_bool(" True \n"));
+        assert!(!parse_kde_bool("false"));
+        assert!(!parse_kde_bool(""));
+        assert_eq!(parse_kde_temperature("5500"), 5500);
+        assert_eq!(parse_kde_temperature("garbage"), KDE_DEFAULT_KELVIN);
+        assert_eq!(parse_kde_temperature("99999"), KDE_NEUTRAL_KELVIN);
+        assert_eq!(parse_kde_temperature("10"), KDE_MIN_KELVIN);
+    }
+
+    #[test]
+    fn manual_means_active_and_constant() {
+        assert!(kde(true, "Constant").is_manual());
+        assert!(!kde(false, "Constant").is_manual());
+        assert!(!kde(true, "Automatic").is_manual());
+    }
+
+    #[test]
+    fn ui_state_reflects_kde_settings() {
+        let state =
+            KdeSettings { active: true, mode: "Constant".into(), temperature: 5500 }.ui_state();
+        assert_eq!(state, NightModeState { enabled: true, temperature: 5500.0 });
+        let state = kde(true, "Automatic").ui_state();
+        assert!(!state.enabled, "a scheduled Night Light is not a manual override");
+    }
+
+    #[test]
+    fn restore_only_while_override_is_in_place() {
+        assert!(should_restore(Some(&kde(true, "Constant"))));
+        assert!(!should_restore(Some(&kde(false, "Constant"))));
+        assert!(!should_restore(Some(&kde(true, "Automatic"))));
+        assert!(should_restore(None));
+    }
+
+    // ── command handling ─────────────────────────────────────────
+
+    #[test]
+    fn successful_command_returns_trimmed_stdout() {
+        let out = run_with_timeout(&mut sh("printf '  hello \\n'"), Duration::from_secs(2));
+        assert_eq!(out.expect("command succeeds"), "hello");
+    }
+
+    #[test]
+    fn failed_command_reports_status_and_stderr() {
+        let err = run_with_timeout(&mut sh("echo boom >&2; exit 3"), Duration::from_secs(2))
+            .expect_err("non-zero exit must fail");
+        match &err {
+            CommandError::Failed { status, stderr } => {
+                assert_eq!(status.code(), Some(3));
+                assert_eq!(stderr, "boom");
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        assert!(err.to_string().contains("boom"), "stderr must appear in the log message");
+    }
+
+    #[test]
+    fn missing_binary_is_a_spawn_error() {
+        let mut cmd = Command::new("definitely-not-a-real-binary-for-wifi-manager");
+        let err = run_with_timeout(&mut cmd, Duration::from_secs(1)).expect_err("cannot spawn");
+        assert!(matches!(err, CommandError::Spawn(_)));
+    }
+
+    #[test]
+    fn timed_out_command_is_killed_and_reported() {
+        let start = Instant::now();
+        let err =
+            run_with_timeout(&mut sh("echo late >&2; exec sleep 5"), Duration::from_millis(200))
+                .expect_err("must time out");
+        match &err {
+            CommandError::Timeout { stderr, .. } => assert_eq!(stderr, "late"),
+            other => panic!("expected Timeout, got {other:?}"),
+        }
+        assert!(start.elapsed() < Duration::from_secs(3), "the child must not be waited for");
+        assert!(err.to_string().contains("timed out"));
     }
 }
