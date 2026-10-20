@@ -25,6 +25,14 @@ impl WifiManager {
     pub(crate) async fn new() -> zbus::Result<Self> {
         let connection = zbus::Connection::system().await?;
 
+        Self::from_connection(connection).await
+    }
+
+    /// Build a manager on an existing bus connection.
+    ///
+    /// Production uses the system bus; tests use a private bus with a fake
+    /// NetworkManager service.
+    pub(crate) async fn from_connection(connection: zbus::Connection) -> zbus::Result<Self> {
         // Get the NM proxy
         let nm = NetworkManagerProxy::new(&connection).await?;
 

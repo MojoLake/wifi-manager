@@ -88,7 +88,7 @@
         devShells.default = craneLib.devShell {
           inputsFrom = [ wifi-manager ];
           packages = with pkgs; [
-            # Add any additional dev tools here
+            dbus # private bus used by the NetworkManager test harness
           ];
         };
       }

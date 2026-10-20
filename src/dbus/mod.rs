@@ -6,3 +6,6 @@ pub(crate) mod network_manager;
 pub(crate) mod power;
 pub(crate) mod proxies;
 pub(crate) mod vpn_manager;
+
+#[cfg(test)]
+pub(crate) mod test_support;
