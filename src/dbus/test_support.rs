@@ -19,6 +19,12 @@ const WIFI_DEVICE_PATH: &str = "/org/freedesktop/NetworkManager/Devices/1";
 
 pub(crate) type TestResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum VanishedAccessPointError {
+    UnknownObject,
+    UnknownMethod,
+}
+
 /// Properties exposed by one fake NetworkManager access point.
 #[derive(Clone, Debug)]
 pub(crate) struct FakeAccessPointConfig {
@@ -30,6 +36,8 @@ pub(crate) struct FakeAccessPointConfig {
     pub(crate) wpa_flags: u32,
     pub(crate) rsn_flags: u32,
     pub(crate) hw_address: String,
+    pub(crate) vanish_on_ssid_read: Option<VanishedAccessPointError>,
+    pub(crate) remove_from_list_on_ssid_read: bool,
 }
 
 impl FakeAccessPointConfig {
@@ -46,7 +54,20 @@ impl FakeAccessPointConfig {
             wpa_flags: 0,
             rsn_flags: 0,
             hw_address: format!("02:00:00:00:00:{path_suffix:02x}"),
+            vanish_on_ssid_read: None,
+            remove_from_list_on_ssid_read: false,
         }
+    }
+
+    pub(crate) fn vanishing_on_read(mut self, error: VanishedAccessPointError) -> Self {
+        self.vanish_on_ssid_read = Some(error);
+        self.remove_from_list_on_ssid_read = true;
+        self
+    }
+
+    pub(crate) fn failing_on_read(mut self, error: VanishedAccessPointError) -> Self {
+        self.vanish_on_ssid_read = Some(error);
+        self
     }
 }
 
@@ -84,7 +105,8 @@ impl FakeNetworkManager {
 
     pub(crate) async fn add_access_point(&self, config: FakeAccessPointConfig) -> TestResult<()> {
         let path = config.path.clone();
-        self.service.object_server().at(path.clone(), FakeAccessPoint::from(config)).await?;
+        let access_point = FakeAccessPoint::new(config, Arc::clone(&self.access_points));
+        self.service.object_server().at(path.clone(), access_point).await?;
         self.access_points.lock().expect("fake AP list lock poisoned").push(path);
         Ok(())
     }
@@ -187,6 +209,7 @@ impl FakeSettings {
 }
 
 struct FakeAccessPoint {
+    path: OwnedObjectPath,
     ssid: Vec<u8>,
     strength: u8,
     frequency: u32,
@@ -194,11 +217,15 @@ struct FakeAccessPoint {
     wpa_flags: u32,
     rsn_flags: u32,
     hw_address: String,
+    vanish_on_ssid_read: Option<VanishedAccessPointError>,
+    remove_from_list_on_ssid_read: bool,
+    access_points: Arc<Mutex<Vec<OwnedObjectPath>>>,
 }
 
-impl From<FakeAccessPointConfig> for FakeAccessPoint {
-    fn from(config: FakeAccessPointConfig) -> Self {
+impl FakeAccessPoint {
+    fn new(config: FakeAccessPointConfig, access_points: Arc<Mutex<Vec<OwnedObjectPath>>>) -> Self {
         Self {
+            path: config.path,
             ssid: config.ssid,
             strength: config.strength,
             frequency: config.frequency,
@@ -206,6 +233,9 @@ impl From<FakeAccessPointConfig> for FakeAccessPoint {
             wpa_flags: config.wpa_flags,
             rsn_flags: config.rsn_flags,
             hw_address: config.hw_address,
+            vanish_on_ssid_read: config.vanish_on_ssid_read,
+            remove_from_list_on_ssid_read: config.remove_from_list_on_ssid_read,
+            access_points,
         }
     }
 }
@@ -213,8 +243,26 @@ impl From<FakeAccessPointConfig> for FakeAccessPoint {
 #[interface(name = "org.freedesktop.NetworkManager.AccessPoint")]
 impl FakeAccessPoint {
     #[zbus(property)]
-    fn ssid(&self) -> Vec<u8> {
-        self.ssid.clone()
+    fn ssid(&self) -> zbus::fdo::Result<Vec<u8>> {
+        let message = "Object does not exist at the requested access-point path".to_string();
+        if self.remove_from_list_on_ssid_read {
+            self.access_points
+                .lock()
+                .expect("fake AP list lock poisoned")
+                .retain(|candidate| candidate != &self.path);
+        }
+
+        match self.vanish_on_ssid_read {
+            Some(VanishedAccessPointError::UnknownObject) => {
+                return Err(zbus::fdo::Error::UnknownObject(message));
+            }
+            Some(VanishedAccessPointError::UnknownMethod) => {
+                return Err(zbus::fdo::Error::UnknownMethod(message));
+            }
+            None => {}
+        }
+
+        Ok(self.ssid.clone())
     }
 
     #[zbus(property)]
@@ -270,6 +318,56 @@ mod tests {
 
             fake.remove_access_point(&access_point_path).await?;
             assert!(wifi.get_networks().await?.is_empty());
+
+            Ok(())
+        })
+    }
+
+    async fn assert_vanished_access_point_is_skipped(
+        error: VanishedAccessPointError,
+    ) -> TestResult<()> {
+        let fake = FakeNetworkManager::start().await?;
+        fake.add_access_point(FakeAccessPointConfig::new(1, "Stable Network")).await?;
+        fake.add_access_point(
+            FakeAccessPointConfig::new(2, "Vanishing Network").vanishing_on_read(error),
+        )
+        .await?;
+
+        let wifi = WifiManager::from_connection(fake.client_connection()).await?;
+        let networks = wifi.get_networks().await?;
+
+        assert_eq!(networks.len(), 1);
+        assert_eq!(networks[0].ssid, "Stable Network");
+
+        Ok(())
+    }
+
+    #[test]
+    fn skips_an_access_point_that_returns_unknown_object() -> TestResult<()> {
+        zbus::block_on(assert_vanished_access_point_is_skipped(
+            VanishedAccessPointError::UnknownObject,
+        ))
+    }
+
+    #[test]
+    fn skips_an_access_point_that_returns_unknown_method() -> TestResult<()> {
+        zbus::block_on(assert_vanished_access_point_is_skipped(
+            VanishedAccessPointError::UnknownMethod,
+        ))
+    }
+
+    #[test]
+    fn propagates_unknown_method_when_access_point_still_exists() -> TestResult<()> {
+        zbus::block_on(async {
+            let fake = FakeNetworkManager::start().await?;
+            fake.add_access_point(
+                FakeAccessPointConfig::new(1, "Broken Network")
+                    .failing_on_read(VanishedAccessPointError::UnknownMethod),
+            )
+            .await?;
+
+            let wifi = WifiManager::from_connection(fake.client_connection()).await?;
+            assert!(wifi.get_networks().await.is_err());
 
             Ok(())
         })
