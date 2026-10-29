@@ -62,6 +62,7 @@
 
         wifi-manager = craneLib.buildPackage (commonArgs // {
           inherit cargoArtifacts;
+          nativeCheckInputs = [ pkgs.dbus ];
         });
 
         cargoClippy = craneLib.cargoClippy (commonArgs // {
