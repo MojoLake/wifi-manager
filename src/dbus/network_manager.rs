@@ -20,11 +20,47 @@ pub(crate) struct WifiManager {
 /// NM device type constant for WiFi
 const NM_DEVICE_TYPE_WIFI: u32 = 2;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AccessPointReadError {
+    UnknownObject,
+    UnknownMethod,
+    Other,
+}
+
+fn classify_access_point_read_error(error: &zbus::Error) -> AccessPointReadError {
+    match error {
+        zbus::Error::FDO(error) => match error.as_ref() {
+            zbus::fdo::Error::UnknownObject(_) => AccessPointReadError::UnknownObject,
+            zbus::fdo::Error::UnknownMethod(_) => AccessPointReadError::UnknownMethod,
+            _ => AccessPointReadError::Other,
+        },
+        zbus::Error::MethodError(name, _, _)
+            if name.as_str() == "org.freedesktop.DBus.Error.UnknownObject" =>
+        {
+            AccessPointReadError::UnknownObject
+        }
+        zbus::Error::MethodError(name, _, _)
+            if name.as_str() == "org.freedesktop.DBus.Error.UnknownMethod" =>
+        {
+            AccessPointReadError::UnknownMethod
+        }
+        _ => AccessPointReadError::Other,
+    }
+}
+
 impl WifiManager {
     /// Connect to D-Bus and find the first WiFi device.
     pub(crate) async fn new() -> zbus::Result<Self> {
         let connection = zbus::Connection::system().await?;
 
+        Self::from_connection(connection).await
+    }
+
+    /// Build a manager on an existing bus connection.
+    ///
+    /// Production uses the system bus; tests use a private bus with a fake
+    /// NetworkManager service.
+    pub(crate) async fn from_connection(connection: zbus::Connection) -> zbus::Result<Self> {
         // Get the NM proxy
         let nm = NetworkManagerProxy::new(&connection).await?;
 
@@ -66,6 +102,9 @@ impl WifiManager {
     pub(crate) async fn get_networks(&self) -> zbus::Result<Vec<Network>> {
         let wireless = WirelessProxy::builder(&self.connection)
             .path(self.wifi_device_path.clone())?
+            // Access-point membership can change while one snapshot is being read. A fresh
+            // value is also required below to distinguish a vanished AP from a broken method.
+            .uncached_properties(&["AccessPoints"])
             .build()
             .await?;
 
@@ -79,45 +118,78 @@ impl WifiManager {
         let saved_ssids = self.get_saved_wifi_ssids().await.unwrap_or_default();
 
         for ap_path in ap_paths {
-            let ap =
-                AccessPointProxy::builder(&self.connection).path(ap_path.clone())?.build().await?;
+            let candidate = async {
+                let ap = AccessPointProxy::builder(&self.connection)
+                    .path(ap_path.clone())?
+                    .build()
+                    .await?;
 
-            // Read AP properties
-            let ssid_bytes = ap.ssid().await?;
-            let ssid = String::from_utf8_lossy(&ssid_bytes).to_string();
+                // Read AP properties
+                let ssid_bytes = ap.ssid().await?;
+                let ssid = String::from_utf8_lossy(&ssid_bytes).to_string();
 
-            // Skip hidden networks (empty SSID)
-            if ssid.is_empty() {
-                continue;
+                // Skip hidden networks (empty SSID)
+                if ssid.is_empty() {
+                    return Ok::<Option<Network>, zbus::Error>(None);
+                }
+
+                let strength = ap.strength().await?;
+                let frequency = ap.frequency().await?;
+                let flags = ap.flags().await?;
+                let wpa_flags = ap.wpa_flags().await?;
+                let rsn_flags = ap.rsn_flags().await?;
+
+                let security = security_from_flags(flags, wpa_flags, rsn_flags);
+                let band = Band::from_frequency(frequency);
+                let ap_path_str = ap_path.to_string();
+
+                let is_connected =
+                    active_ap.as_ref().map(|active| *active == ap_path_str).unwrap_or(false);
+
+                let is_saved = saved_ssids.contains_key(&ssid);
+                let connection_path = saved_ssids.get(&ssid).cloned();
+
+                Ok(Some(Network {
+                    ssid,
+                    strength,
+                    security,
+                    is_connected,
+                    is_saved,
+                    band,
+                    ap_path: ap_path_str,
+                    connection_path,
+                }))
             }
+            .await;
 
-            let strength = ap.strength().await?;
-            let frequency = ap.frequency().await?;
-            let flags = ap.flags().await?;
-            let wpa_flags = ap.wpa_flags().await?;
-            let rsn_flags = ap.rsn_flags().await?;
+            let candidate = match candidate {
+                Ok(Some(candidate)) => candidate,
+                Ok(None) => continue,
+                Err(error)
+                    if classify_access_point_read_error(&error)
+                        == AccessPointReadError::UnknownObject =>
+                {
+                    log::debug!("Access point {ap_path} disappeared during enumeration: {error}");
+                    continue;
+                }
+                Err(error)
+                    if classify_access_point_read_error(&error)
+                        == AccessPointReadError::UnknownMethod =>
+                {
+                    // NetworkManager sometimes reports a vanished object as UnknownMethod.
+                    // Confirm that the path actually disappeared before suppressing the error.
+                    let current_ap_paths = wireless.access_points().await?;
+                    if current_ap_paths.contains(&ap_path) {
+                        return Err(error);
+                    }
 
-            let security = security_from_flags(flags, wpa_flags, rsn_flags);
-            let band = Band::from_frequency(frequency);
-            let ap_path_str = ap_path.to_string();
-
-            let is_connected =
-                active_ap.as_ref().map(|active| *active == ap_path_str).unwrap_or(false);
-
-            let is_saved = saved_ssids.contains_key(&ssid);
-            let connection_path = saved_ssids.get(&ssid).cloned();
-
-            let candidate = Network {
-                ssid: ssid.clone(),
-                strength,
-                security,
-                is_connected,
-                is_saved,
-                band,
-                ap_path: ap_path_str,
-                connection_path,
+                    log::debug!("Access point {ap_path} disappeared during enumeration: {error}");
+                    continue;
+                }
+                Err(error) => return Err(error),
             };
 
+            let ssid = candidate.ssid.clone();
             // Deduplication: keep the strongest AP, with a stable path tie-break.
             match networks_by_ssid.get(&ssid) {
                 Some(existing) if !candidate_is_preferred(existing, &candidate) => continue,
